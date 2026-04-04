@@ -1,0 +1,1133 @@
+#!/usr/bin/env python3
+# coding: utf-8
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║         DeepFocus-BP — Extended Rigorous Benchmark                          ║
+║         Pybind11 C++ Routing Engine  |  CUDA GPU Training                  ║
+║         Author: Claudio Fernandes | April 2026                              ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Experiments:                                                                ║
+║   A) SST-2 Sentiment (binary)  — Transformer  4.5M  (replication+new DS)   ║
+║   B) AG News (4-class)         — Transformer  4.5M  (harder, multi-class)  ║
+║   C) SST-2 Scale-Up            — Transformer   18M  (larger model)         ║
+║   D) CIFAR-10 Vision           — ResNet-18     11M  (cross-modality)        ║
+║                                                                              ║
+║  Methods:  Dense BP  |  DeepFocus-BP  |  Random DropConnect                 ║
+║  Seeds:    [42, 123, 456]  per experiment                                   ║
+║  Stats:    Welch t-test, Cohen's d, Bootstrap 95% CI (n=1000)               ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 0 — SETUP & DEPENDENCIES
+# ══════════════════════════════════════════════════════════════════════════════
+import subprocess, sys, os, time, json, math, random, warnings
+from pathlib import Path
+from collections import defaultdict
+from datetime import datetime
+
+warnings.filterwarnings("ignore")
+
+def _pip(pkg: str) -> None:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
+for _pkg in ["pybind11", "datasets", "scipy"]:
+    _pip(_pkg)
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, Subset
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from scipy import stats as scipy_stats
+import pybind11
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+print("═" * 76)
+print(f"  DeepFocus-BP Extended Benchmark  |  {_now}")
+print(f"  Device  : {DEVICE}")
+print(f"  PyTorch : {torch.__version__}")
+if torch.cuda.is_available():
+    _gp = torch.cuda.get_device_properties(0)
+    print(f"  GPU     : {_gp.name}  |  VRAM: {_gp.total_memory / 1e9:.1f} GB")
+print("═" * 76 + "\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — PYBIND11 C++ ROUTING ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+# The C++ module is responsible for:
+#   • Storing per-block Epartial history (rolling window of 512 values)
+#   • Computing EMA-based Alpha (P25) / Beta (P75) thresholds
+#   • Making routing decisions: SKIP(0) / LOW_PRECISION(1) / FULL_PRECISION(2)
+#   • Bernoulli ergodicity: randomly forces FULL to prevent permanent stagnation
+#   • Tracking routing counts for FLOPs accounting
+# Gradient sampling and stochastic rounding are done in PyTorch/GPU for speed.
+
+_CPP_SOURCE = r"""
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <random>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+
+namespace py = pybind11;
+
+struct BlockState {
+    // Rolling history of Epartial values
+    std::vector<float> history;
+    static constexpr size_t MAX_HIST = 512;
+
+    // EMA thresholds
+    float alpha = 0.0f;   // lower threshold (P25 EMA)
+    float beta  = 1.0f;   // upper threshold (P75 EMA)
+    bool  initialized = false;
+
+    // Routing counters (reset per epoch)
+    long long cnt_skip = 0, cnt_low = 0, cnt_full = 0, cnt_total = 0;
+    // Cumulative counters (never reset)
+    long long cum_skip = 0, cum_low = 0, cum_full = 0, cum_total = 0;
+
+    void push(float e) {
+        history.push_back(e);
+        if (history.size() > MAX_HIST)
+            history.erase(history.begin());
+    }
+
+    void update_thresholds(float ema_alpha) {
+        if (history.size() < 8) return;
+        std::vector<float> s(history);
+        std::sort(s.begin(), s.end());
+        size_t n = s.size();
+        float p25 = s[n / 4];
+        float p75 = s[3 * n / 4];
+        if (!initialized) {
+            alpha = p25; beta = p75;
+            initialized = true;
+        } else {
+            alpha = ema_alpha * p25 + (1.0f - ema_alpha) * alpha;
+            beta  = ema_alpha * p75 + (1.0f - ema_alpha) * beta;
+        }
+        // Guard: alpha < beta always
+        if (alpha >= beta) beta = alpha + 1e-6f;
+    }
+};
+
+class DeepFocusRouter {
+public:
+    DeepFocusRouter(int n_blocks,
+                    float ema_alpha   = 0.05f,
+                    float bernoulli_p = 0.01f)
+        : n_blocks_(n_blocks),
+          ema_alpha_(ema_alpha),
+          bern_p_(bernoulli_p),
+          rng_(std::random_device{}()),
+          bern_(bernoulli_p),
+          uni_(0.0f, 1.0f)
+    {
+        blocks_.resize(n_blocks_);
+    }
+
+    // Called once per block per backward step with the scalar Epartial.
+    // Returns routing decision: 0=SKIP, 1=LOW, 2=FULL
+    int update_and_route(float epartial, int block_id) {
+        _check(block_id);
+        auto& b = blocks_[block_id];
+
+        b.push(epartial);
+        b.update_thresholds(ema_alpha_);
+
+        b.cnt_total++; b.cum_total++;
+
+        // Bernoulli ergodicity: forced FULL regardless of Epartial
+        if (bern_(rng_)) {
+            b.cnt_full++; b.cum_full++;
+            return 2;
+        }
+
+        if (!b.initialized || epartial > b.beta) {
+            b.cnt_full++; b.cum_full++;
+            return 2;  // FULL
+        } else if (epartial < b.alpha) {
+            b.cnt_skip++; b.cum_skip++;
+            return 0;  // SKIP
+        } else {
+            b.cnt_low++;  b.cum_low++;
+            return 1;  // LOW
+        }
+    }
+
+    // Reset per-epoch counters (call at start of each epoch)
+    void reset_epoch() {
+        for (auto& b : blocks_)
+            b.cnt_skip = b.cnt_low = b.cnt_full = b.cnt_total = 0;
+    }
+
+    // Aggregate statistics across all blocks
+    py::dict get_stats(bool cumulative = false) const {
+        long long tot_s = 0, tot_l = 0, tot_f = 0, tot_t = 0;
+        std::vector<float> alphas, betas;
+
+        for (auto& b : blocks_) {
+            long long s = cumulative ? b.cum_skip  : b.cnt_skip;
+            long long l = cumulative ? b.cum_low   : b.cnt_low;
+            long long f = cumulative ? b.cum_full  : b.cnt_full;
+            long long t = cumulative ? b.cum_total : b.cnt_total;
+            tot_s += s; tot_l += l; tot_f += f; tot_t += t;
+            if (b.initialized) {
+                alphas.push_back(b.alpha);
+                betas.push_back(b.beta);
+            }
+        }
+
+        float skip_r = tot_t > 0 ? float(tot_s) / tot_t : 0.0f;
+        float low_r  = tot_t > 0 ? float(tot_l) / tot_t : 0.0f;
+        float full_r = tot_t > 0 ? float(tot_f) / tot_t : 0.0f;
+        // Theoretical FLOPs fraction actually used (SKIP=0, LOW=0.5, FULL=1.0)
+        float flops_used     = skip_r * 0.0f + low_r * 0.5f + full_r * 1.0f;
+        float flops_reduction = 1.0f - flops_used;
+
+        auto mean_vec = [](const std::vector<float>& v) {
+            if (v.empty()) return 0.0f;
+            return std::accumulate(v.begin(), v.end(), 0.0f) / v.size();
+        };
+
+        py::dict d;
+        d["skip_rate"]       = skip_r;
+        d["low_rate"]        = low_r;
+        d["full_rate"]       = full_r;
+        d["flops_used"]      = flops_used;
+        d["flops_reduction"] = flops_reduction;
+        d["alpha_mean"]      = mean_vec(alphas);
+        d["beta_mean"]       = mean_vec(betas);
+        d["total_decisions"] = tot_t;
+        return d;
+    }
+
+    // Per-block diagnostic (for detailed logs)
+    py::list get_block_stats() const {
+        py::list out;
+        for (int i = 0; i < n_blocks_; i++) {
+            auto& b = blocks_[i];
+            py::dict d;
+            d["block_id"] = i;
+            d["alpha"]    = b.alpha;
+            d["beta"]     = b.beta;
+            long long t = b.cnt_total;
+            d["skip_pct"] = t > 0 ? 100.0f * b.cnt_skip / t : 0.0f;
+            d["low_pct"]  = t > 0 ? 100.0f * b.cnt_low  / t : 0.0f;
+            d["full_pct"] = t > 0 ? 100.0f * b.cnt_full / t : 0.0f;
+            out.append(d);
+        }
+        return out;
+    }
+
+    int n_blocks() const { return n_blocks_; }
+
+private:
+    void _check(int id) const {
+        if (id < 0 || id >= n_blocks_)
+            throw std::out_of_range("block_id=" + std::to_string(id) +
+                                    " out of range [0," + std::to_string(n_blocks_) + ")");
+    }
+
+    int   n_blocks_;
+    float ema_alpha_, bern_p_;
+    std::mt19937                        rng_;
+    std::bernoulli_distribution         bern_;
+    std::uniform_real_distribution<float> uni_;
+    std::vector<BlockState>             blocks_;
+};
+
+PYBIND11_MODULE(deepfocus_engine, m) {
+    m.doc() = "DeepFocus-BP C++ Routing Engine — Fernandes 2026";
+    py::class_<DeepFocusRouter>(m, "DeepFocusRouter")
+        .def(py::init<int, float, float>(),
+             py::arg("n_blocks"),
+             py::arg("ema_alpha")   = 0.05f,
+             py::arg("bernoulli_p") = 0.01f)
+        .def("update_and_route",  &DeepFocusRouter::update_and_route,
+             py::arg("epartial"), py::arg("block_id"))
+        .def("reset_epoch",       &DeepFocusRouter::reset_epoch)
+        .def("get_stats",         &DeepFocusRouter::get_stats,
+             py::arg("cumulative") = false)
+        .def("get_block_stats",   &DeepFocusRouter::get_block_stats)
+        .def("n_blocks",          &DeepFocusRouter::n_blocks);
+}
+"""
+
+# ── Compile ───────────────────────────────────────────────────────────────────
+import sysconfig as _sysconfig
+
+_BUILD = Path("/tmp/dfbp")
+_BUILD.mkdir(exist_ok=True)
+_CPP_PATH = _BUILD / "deepfocus_engine.cpp"
+_CPP_PATH.write_text(_CPP_SOURCE)
+
+# ── Portable header/suffix detection via sysconfig (no python3-config needed) ─
+# Include dirs: Python.h + any extra include path the interpreter was built with
+_PY_INC_DIR  = _sysconfig.get_path("include")       # e.g. /usr/include/python3.12
+_PY_PLAT_INC = _sysconfig.get_path("platinclude")   # sometimes different on Conda/Kaggle
+_PB_INC      = pybind11.get_include()
+
+# Build -I flags, deduplicated
+_inc_dirs = dict.fromkeys(
+    d for d in [_PY_INC_DIR, _PY_PLAT_INC, _PB_INC] if d
+)
+_INC_FLAGS = " ".join(f"-I{d}" for d in _inc_dirs)
+
+# Shared-library suffix: .cpython-312-x86_64-linux-gnu.so (or just .so)
+_EXT_SFX = _sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+_SO_PATH  = _BUILD / f"deepfocus_engine{_EXT_SFX}"
+
+# Compiler: prefer g++ for better C++17 support; fall back to c++
+_CXX = "g++" if os.system("which g++ >/dev/null 2>&1") == 0 else "c++"
+
+_CMD = (
+    f"{_CXX} -O3 -Wall -shared -std=c++17 -fPIC "
+    f"{_INC_FLAGS} "
+    f"{_CPP_PATH} -o {_SO_PATH}"
+)
+print(f"🔧  Compiling DeepFocus C++ routing engine …")
+print(f"    CXX      : {_CXX}")
+print(f"    Includes : {_INC_FLAGS}")
+print(f"    Output   : {_SO_PATH}")
+
+_proc = subprocess.run(_CMD, shell=True, capture_output=True, text=True)
+if _proc.returncode != 0:
+    print(f"  STDERR:\n{_proc.stderr}")
+    print(f"  STDOUT:\n{_proc.stdout}")
+    raise RuntimeError(
+        f"C++ compilation failed (exit {_proc.returncode}). "
+        "Check that g++/c++ and pybind11 are installed."
+    )
+
+sys.path.insert(0, str(_BUILD))
+import deepfocus_engine as dfe
+
+print(f"✅  Engine compiled  →  {_SO_PATH.name}")
+print(f"    {dfe.__doc__}\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — PYTORCH UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROBE_FRAC = 0.10   # fraction of gradient elements sampled for Epartial
+
+def sample_epartial(param_grads: list, probe_frac: float = PROBE_FRAC) -> float:
+    """
+    Fast GPU-side stochastic probe: randomly sample probe_frac of all gradient
+    values across the block, compute L2 norm of the sample.
+    Returns a scalar float (cheap: only k floats transferred to CPU).
+    """
+    flat = torch.cat([g.detach().reshape(-1) for g in param_grads if g is not None])
+    if flat.numel() == 0:
+        return 0.0
+    k = max(16, int(flat.numel() * probe_frac))
+    k = min(k, flat.numel())
+    idx = torch.randint(0, flat.numel(), (k,), device=flat.device)
+    sample = flat[idx]
+    return (sample.norm() / math.sqrt(k)).item()
+
+
+@torch.no_grad()
+def stochastic_round_fp8_gpu(grad: torch.Tensor, scale: float = 448.0) -> torch.Tensor:
+    """
+    Simulates FP8 E4M3 quantization via stochastic rounding, fully on GPU.
+    Preserves gradient expectation: E[round(x)] = x.
+    Cost: ~50% of FP32 backward (memory bandwidth reduction).
+    """
+    g = grad.float().clamp(-scale, scale)
+    step = 2.0 * scale / 255.0
+    q = (g / step).floor()
+    frac = g / step - q
+    noise = torch.rand_like(g)
+    q = q + (noise < frac).to(g.dtype)
+    return (q * step).to(grad.dtype)
+
+
+def compute_grad_norm(model: nn.Module) -> float:
+    """Global gradient L2 norm across all parameters."""
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total += p.grad.detach().norm().item() ** 2
+    return math.sqrt(total)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — MODEL DEFINITIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TransformerBlock(nn.Module):
+    """Single Transformer encoder block: Multi-Head Self-Attention + FFN."""
+    def __init__(self, d_model: int, n_heads: int, ffn_dim: int, dropout: float):
+        super().__init__()
+        self.attn  = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ffn   = nn.Sequential(
+            nn.Linear(d_model, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, d_model),
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.drop  = nn.Dropout(dropout)
+
+    def forward(self, x, pad_mask=None):
+        a, _ = self.attn(x, x, x, key_padding_mask=pad_mask)
+        x = self.norm1(x + self.drop(a))
+        x = self.norm2(x + self.drop(self.ffn(x)))
+        return x
+
+
+class TransformerClassifier(nn.Module):
+    """Transformer encoder with mean-pooled classification head."""
+    def __init__(self, n_classes: int, d_model: int, n_heads: int,
+                 ffn_dim: int, n_layers: int, vocab_size: int,
+                 max_len: int = 128, dropout: float = 0.1):
+        super().__init__()
+        self.embed     = nn.Embedding(vocab_size, d_model, padding_idx=0)
+        self.pos_embed = nn.Embedding(max_len + 1, d_model)
+        self.drop      = nn.Dropout(dropout)
+        self.blocks    = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, ffn_dim, dropout)
+            for _ in range(n_layers)
+        ])
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, n_classes),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, 0.0, 0.02)
+
+    def forward(self, ids, mask=None):
+        B, T = ids.shape
+        pos = torch.arange(T, device=ids.device).unsqueeze(0).expand(B, -1)
+        x = self.drop(self.embed(ids) + self.pos_embed(pos))
+        pad = (mask == 0) if mask is not None else None
+        for blk in self.blocks:
+            x = blk(x, pad_mask=pad)
+        if mask is not None:
+            mf = mask.float().unsqueeze(-1)
+            x  = (x * mf).sum(1) / mf.sum(1).clamp(min=1e-9)
+        else:
+            x = x.mean(1)
+        return self.head(x)
+
+    def get_blocks(self):
+        """Returns [(block_id, nn.Module), …] for routing."""
+        return list(enumerate(self.blocks))
+
+    def n_params(self): return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# ── ResNet-18 ──────────────────────────────────────────────────────────────
+class BasicBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(out_ch)
+        self.skip  = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        out = self.bn2(self.conv2(out))
+        return F.relu(out + self.skip(x), inplace=True)
+
+
+class ResNet18(nn.Module):
+    def __init__(self, n_classes: int = 10):
+        super().__init__()
+        self.stem  = nn.Sequential(
+            nn.Conv2d(3, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+        )
+        cfg = [(64, 64, 1), (64, 128, 2), (128, 256, 2), (256, 512, 2)]
+        self._block_list: list[nn.Module] = []
+        self.layers = nn.ModuleList()
+        for in_ch, out_ch, stride in cfg:
+            blk1 = BasicBlock(in_ch,  out_ch, stride)
+            blk2 = BasicBlock(out_ch, out_ch, 1)
+            self.layers.append(nn.Sequential(blk1, blk2))
+            self._block_list.extend([blk1, blk2])
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Linear(512, n_classes)
+
+    def forward(self, x):
+        x = self.stem(x)
+        for layer in self.layers:
+            x = layer(x)
+        return self.head(self.pool(x).flatten(1))
+
+    def get_blocks(self): return list(enumerate(self._block_list))
+    def n_params(self):   return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — DATASET LOADING (with module-level cache)
+# ══════════════════════════════════════════════════════════════════════════════
+
+VOCAB_SIZE = 30_000
+MAX_LEN    = 128
+
+class SimpleVocab:
+    PAD, UNK = 0, 1
+    def __init__(self, max_vocab: int = VOCAB_SIZE):
+        self._max = max_vocab
+        self.w2i: dict[str, int] = {"<PAD>": 0, "<UNK>": 1}
+
+    def build(self, texts: list[str]) -> None:
+        from collections import Counter
+        cnt = Counter(w for t in texts for w in t.lower().split())
+        for w, _ in cnt.most_common(self._max - 2):
+            if w not in self.w2i:
+                self.w2i[w] = len(self.w2i)
+        print(f"   Vocab built: {len(self.w2i):,} tokens")
+
+    def encode(self, text: str, max_len: int = MAX_LEN):
+        toks = text.lower().split()[:max_len]
+        ids  = [self.w2i.get(t, self.UNK) for t in toks]
+        mask = [1] * len(ids)
+        pad  = max_len - len(ids)
+        return ids + [self.PAD] * pad, mask + [0] * pad
+
+
+class TextDataset(Dataset):
+    def __init__(self, texts, labels, vocab: SimpleVocab, max_len: int = MAX_LEN):
+        self.texts, self.labels, self.vocab, self.max_len = texts, labels, vocab, max_len
+
+    def __len__(self): return len(self.texts)
+
+    def __getitem__(self, idx):
+        ids, mask = self.vocab.encode(self.texts[idx], self.max_len)
+        return (
+            torch.tensor(ids,                dtype=torch.long),
+            torch.tensor(mask,               dtype=torch.long),
+            torch.tensor(self.labels[idx],   dtype=torch.long),
+        )
+
+
+_DS_CACHE: dict = {}   # raw HuggingFace datasets + vocabularies
+
+def _get_sst2():
+    if "sst2" not in _DS_CACHE:
+        from datasets import load_dataset
+        print("  ↳ Downloading SST-2 …")
+        ds = load_dataset("glue", "sst2")
+        texts_all = [x["sentence"] for x in ds["train"]]
+        vocab = SimpleVocab(); vocab.build(texts_all)
+        _DS_CACHE["sst2"]       = ds
+        _DS_CACHE["sst2_vocab"] = vocab
+    return _DS_CACHE["sst2"], _DS_CACHE["sst2_vocab"]
+
+def _get_agnews():
+    if "agnews" not in _DS_CACHE:
+        from datasets import load_dataset
+        print("  ↳ Downloading AG News …")
+        ds = load_dataset("ag_news")
+        texts_all = [x["text"] for x in ds["train"]]
+        vocab = SimpleVocab(); vocab.build(texts_all)
+        _DS_CACHE["agnews"]       = ds
+        _DS_CACHE["agnews_vocab"] = vocab
+    return _DS_CACHE["agnews"], _DS_CACHE["agnews_vocab"]
+
+def _get_cifar10():
+    if "cifar10" not in _DS_CACHE:
+        import torchvision, torchvision.transforms as T
+        print("  ↳ Downloading CIFAR-10 …")
+        aug = T.Compose([T.RandomCrop(32, 4), T.RandomHorizontalFlip(),
+                         T.ToTensor(), T.Normalize((0.4914,0.4822,0.4465),(0.2023,0.1994,0.2010))])
+        std = T.Compose([T.ToTensor(), T.Normalize((0.4914,0.4822,0.4465),(0.2023,0.1994,0.2010))])
+        tr = torchvision.datasets.CIFAR10("/tmp/cifar10", train=True,  download=True, transform=aug)
+        te = torchvision.datasets.CIFAR10("/tmp/cifar10", train=False, download=True, transform=std)
+        _DS_CACHE["cifar10"] = (tr, te)
+    return _DS_CACHE["cifar10"]
+
+
+_MIN_EVAL = 100   # absolute minimum examples required in each eval split
+
+def make_text_loaders(dataset_name: str, n_train: int, n_val: int, n_test: int,
+                      batch_size: int, seed: int):
+    rng = random.Random(seed)
+    if dataset_name == "sst2":
+        ds, vocab = _get_sst2()
+        tr_raw = [(x["sentence"], x["label"]) for x in ds["train"]]
+        # SST-2 official validation = 872 rows (no labels in test split)
+        # We use the validation split for both val and test → proportional 60/40
+        eval_raw = [(x["sentence"], x["label"]) for x in ds["validation"]]
+    else:  # agnews — test split has 7600 rows, plenty of room
+        ds, vocab = _get_agnews()
+        tr_raw   = [(x["text"], x["label"]) for x in ds["train"]]
+        eval_raw = [(x["text"],  x["label"]) for x in ds["test"]]
+
+    # ── Train split ────────────────────────────────────────────────────────────
+    tr_idx = rng.sample(range(len(tr_raw)), min(n_train, len(tr_raw)))
+
+    # ── Val / Test split  (robust: never exceed available, never starve either)
+    avail = len(eval_raw)
+    # Desired totals, capped at what is available
+    want_val  = min(n_val,  avail - _MIN_EVAL)   # leave room for test
+    want_test = min(n_test, avail - _MIN_EVAL)   # leave room for val
+    # If dataset is very small, fall back to 60/40 proportional split
+    if want_val <= 0 or want_test <= 0:
+        want_val  = max(_MIN_EVAL, int(avail * 0.6))
+        want_test = max(_MIN_EVAL, avail - want_val)
+    # Final cap: val + test ≤ avail
+    total_eval = min(want_val + want_test, avail)
+    want_val   = min(want_val,  total_eval - _MIN_EVAL)
+    want_test  = total_eval - want_val
+
+    eval_idx = rng.sample(range(avail), total_eval)
+    val_idx  = eval_idx[:want_val]
+    test_idx = eval_idx[want_val:want_val + want_test]
+
+    def mk(pairs, idx): return [pairs[i][0] for i in idx], [pairs[i][1] for i in idx]
+
+    tr_t,  tr_l  = mk(tr_raw,   tr_idx)
+    vl_t,  vl_l  = mk(eval_raw, val_idx)
+    te_t,  te_l  = mk(eval_raw, test_idx)
+
+    print(f"   Split sizes → train={len(tr_t):,}  val={len(vl_t):,}  test={len(te_t):,}  "
+          f"(eval pool={avail:,})")
+
+    nw = 2
+    tr_dl = DataLoader(TextDataset(tr_t, tr_l, vocab), batch_size=batch_size,   shuffle=True,  num_workers=nw, pin_memory=True)
+    vl_dl = DataLoader(TextDataset(vl_t, vl_l, vocab), batch_size=batch_size*2, shuffle=False, num_workers=nw, pin_memory=True)
+    te_dl = DataLoader(TextDataset(te_t, te_l, vocab), batch_size=batch_size*2, shuffle=False, num_workers=nw, pin_memory=True)
+    return tr_dl, vl_dl, te_dl
+
+
+def make_cifar10_loaders(batch_size: int, seed: int):
+    tr_full, te_full = _get_cifar10()
+    rng = random.Random(seed)
+    all_te = list(range(len(te_full)))
+    rng.shuffle(all_te)
+    val_idx  = all_te[:2000]
+    test_idx = all_te[2000:4000]
+    tr_dl  = DataLoader(tr_full,              batch_size=batch_size,   shuffle=True,  num_workers=2, pin_memory=True)
+    vl_dl  = DataLoader(Subset(te_full, val_idx),  batch_size=batch_size*2, shuffle=False, num_workers=2, pin_memory=True)
+    te_dl  = DataLoader(Subset(te_full, test_idx), batch_size=batch_size*2, shuffle=False, num_workers=2, pin_memory=True)
+    return tr_dl, vl_dl, te_dl
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — DEEPFOCUS ROUTING CORE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Target rates for Random DropConnect (from paper's stabilized distribution)
+_RAND_SKIP = 0.26
+_RAND_LOW  = 0.49
+# _RAND_FULL = 0.25   (remainder)
+
+def apply_routing(model: nn.Module,
+                  method: str,
+                  router,            # dfe.DeepFocusRouter | None
+                  ) -> dict:
+    """
+    Called AFTER loss.backward(), BEFORE optimizer.step().
+
+    For each block:
+      1. Sample probe_frac of gradient magnitudes → Epartial (GPU, cheap)
+      2. Route via C++ engine (DeepFocus) or randomly (Random baseline)
+      3. Apply routing:
+         SKIP  → zero all gradients in block  (100% savings)
+         LOW   → stochastic FP8 rounding      ( ~50% savings)
+         FULL  → no modification              (0% savings)
+
+    Returns per-step routing summary dict.
+    """
+    if method == "dense":
+        return {"skip": 0.0, "low": 0.0, "full": 1.0, "flops_used": 1.0}
+
+    blocks = model.get_blocks()
+    decisions = []
+
+    for block_id, block in blocks:
+        pgrads = [p.grad for p in block.parameters() if p.grad is not None]
+        if not pgrads:
+            decisions.append(2)   # treat as FULL if no gradients
+            continue
+
+        # ── Epartial (sampled probe on GPU, scalar transferred) ──────────
+        epartial = sample_epartial(pgrads)
+
+        # ── Routing decision ──────────────────────────────────────────────
+        if method == "deepfocus":
+            decision = router.update_and_route(epartial, block_id)
+        else:  # random
+            r = random.random()
+            if r < _RAND_SKIP:
+                decision = 0
+            elif r < _RAND_SKIP + _RAND_LOW:
+                decision = 1
+            else:
+                decision = 2
+
+        decisions.append(decision)
+
+        # ── Apply routing ─────────────────────────────────────────────────
+        if decision == 0:          # SKIP — zero gradients
+            for p in block.parameters():
+                if p.grad is not None:
+                    p.grad.zero_()
+
+        elif decision == 1:        # LOW — stochastic FP8 rounding (on GPU)
+            for p in block.parameters():
+                if p.grad is not None:
+                    p.grad.copy_(stochastic_round_fp8_gpu(p.grad))
+
+        # FULL — leave gradients untouched
+
+    n = len(decisions)
+    n_skip = decisions.count(0)
+    n_low  = decisions.count(1)
+    n_full = decisions.count(2)
+    flops_used = (n_full * 1.0 + n_low * 0.5) / n if n > 0 else 1.0
+
+    return {
+        "skip":       n_skip / n,
+        "low":        n_low  / n,
+        "full":       n_full / n,
+        "flops_used": flops_used,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — TRAINING & EVALUATION LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, is_text: bool):
+    model.eval()
+    tot_loss = tot_correct = tot_n = 0
+    for batch in loader:
+        if is_text:
+            ids, mask, lbl = [x.to(DEVICE) for x in batch]
+            logits = model(ids, mask)
+        else:
+            imgs, lbl = batch[0].to(DEVICE), batch[1].to(DEVICE)
+            logits = model(imgs)
+        tot_loss    += criterion(logits, lbl).item() * lbl.size(0)
+        tot_correct += (logits.argmax(1) == lbl).sum().item()
+        tot_n       += lbl.size(0)
+    model.train()
+    if tot_n == 0:
+        raise RuntimeError(
+            "evaluate() called on an empty DataLoader — the split produced 0 samples. "
+            "Check n_val/n_test vs. dataset size."
+        )
+    return tot_loss / tot_n, tot_correct / tot_n
+
+
+def train_one_run(model, train_dl, val_dl, test_dl,
+                  method: str, router,
+                  epochs: int, lr: float,
+                  is_text: bool, label: str) -> dict:
+    """
+    Full training run. Returns per-epoch log + final test metrics.
+    """
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
+
+    if router is not None:
+        router.reset_epoch()
+
+    LOG_FREQ    = max(1, len(train_dl) // 4)   # 4 intra-epoch log points
+    run_start   = time.time()
+    best_val_acc = 0.0
+    epoch_logs: list[dict] = []
+
+    # Running FLOPs accumulators
+    cum_flops_used = 0.0      # sum of per-step flops_used
+    cum_steps      = 0
+
+    for epoch in range(1, epochs + 1):
+        ep_start = time.time()
+        model.train()
+        if router: router.reset_epoch()
+
+        ep_loss = ep_correct = ep_n = 0
+        ep_skip = ep_low = ep_full = ep_flops = 0.0
+        ep_gnorm = 0.0
+        step_cnt = 0
+
+        for step, batch in enumerate(train_dl):
+            if is_text:
+                ids, mask, lbl = [x.to(DEVICE) for x in batch]
+                logits = model(ids, mask)
+            else:
+                imgs, lbl = batch[0].to(DEVICE), batch[1].to(DEVICE)
+                logits = model(imgs)
+
+            loss = criterion(logits, lbl)
+            optimizer.zero_grad()
+            loss.backward()
+
+            # ── DeepFocus routing (modifies .grad in-place) ───────────────
+            routing = apply_routing(model, method, router)
+
+            # ── Gradient clipping (after routing) ─────────────────────────
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            gnorm = compute_grad_norm(model)
+
+            optimizer.step()
+
+            # ── Accumulate metrics ────────────────────────────────────────
+            bs = lbl.size(0)
+            ep_loss    += loss.item() * bs
+            ep_correct += (logits.argmax(1) == lbl).sum().item()
+            ep_n       += bs
+            ep_skip    += routing["skip"]
+            ep_low     += routing["low"]
+            ep_full    += routing["full"]
+            ep_flops   += routing["flops_used"]
+            ep_gnorm   += gnorm
+            step_cnt   += 1
+            cum_flops_used += routing["flops_used"]
+            cum_steps      += 1
+
+            # ── Intra-epoch step log ──────────────────────────────────────
+            if (step + 1) % LOG_FREQ == 0 or step == len(train_dl) - 1:
+                sc = step_cnt
+                _skip = ep_skip / sc; _low = ep_low / sc; _full = ep_full / sc
+                _fr   = 1.0 - ep_flops / sc
+                _mem  = torch.cuda.memory_reserved(0) / 1e9 if torch.cuda.is_available() else 0.0
+                print(
+                    f"  E{epoch:02d} │ step {step+1:04d}/{len(train_dl):04d} │ "
+                    f"loss {ep_loss/ep_n:.4f}  acc {ep_correct/ep_n:.4f} │ "
+                    f"Skip {_skip:.0%}  Low {_low:.0%}  Full {_full:.0%} │ "
+                    f"FLOPs↓ {_fr:.2%}  ‖∇‖ {gnorm:.3f}  GPU {_mem:.1f}GB"
+                )
+
+        # ── End-of-epoch ──────────────────────────────────────────────────
+        scheduler.step()
+        val_loss, val_acc = evaluate(model, val_dl, criterion, is_text)
+        best_val_acc = max(best_val_acc, val_acc)
+        ep_time = time.time() - ep_start
+
+        s = step_cnt
+        avg = lambda x: x / s
+        ep_dict = dict(
+            epoch       = epoch,
+            train_loss  = ep_loss / ep_n,
+            train_acc   = ep_correct / ep_n,
+            val_loss    = val_loss,
+            val_acc     = val_acc,
+            skip_rate   = avg(ep_skip),
+            low_rate    = avg(ep_low),
+            full_rate   = avg(ep_full),
+            flops_reduction = 1.0 - avg(ep_flops),
+            grad_norm   = avg(ep_gnorm),
+            lr          = scheduler.get_last_lr()[0],
+            epoch_time_s = ep_time,
+        )
+        if router:
+            ep_dict["router_stats"]      = dict(router.get_stats(cumulative=False))
+            ep_dict["router_block_stats"] = [dict(b) for b in router.get_block_stats()]
+        epoch_logs.append(ep_dict)
+
+        # Per-block diagnostic (DeepFocus only)
+        blk_info = ""
+        if router and method == "deepfocus":
+            bstats = [dict(b) for b in router.get_block_stats()]
+            blk_info = "  │ Per-block: " + "  ".join(
+                f"B{b['block_id']}[α={b['alpha']:.3f} β={b['beta']:.3f} "
+                f"S{b['skip_pct']:.0f}%/L{b['low_pct']:.0f}%/F{b['full_pct']:.0f}%]"
+                for b in bstats
+            )
+
+        print(f"\n  ┌{'─'*66}┐")
+        print(f"  │  EPOCH {epoch:02d}/{epochs}  ─  {method.upper()}  ─  {label}")
+        print(f"  │  Train  loss={ep_dict['train_loss']:.4f}  acc={ep_dict['train_acc']:.4f}")
+        print(f"  │  Val    loss={val_loss:.4f}  acc={val_acc:.4f}  (best={best_val_acc:.4f})")
+        print(f"  │  Route  Skip={ep_dict['skip_rate']:.2%}  Low={ep_dict['low_rate']:.2%}  Full={ep_dict['full_rate']:.2%}")
+        print(f"  │  FLOPs↓ {ep_dict['flops_reduction']:.2%} (theoretical)  ‖∇‖={ep_dict['grad_norm']:.4f}  LR={ep_dict['lr']:.2e}  t={ep_time:.1f}s")
+        if blk_info: print(blk_info)
+        print(f"  └{'─'*66}┘\n")
+
+    # ── Final test ────────────────────────────────────────────────────────────
+    test_loss, test_acc = evaluate(model, test_dl, criterion, is_text)
+    run_time = time.time() - run_start
+    overall_flops_red = 1.0 - (cum_flops_used / cum_steps) if cum_steps > 0 else 0.0
+    cum_router_stats  = dict(router.get_stats(cumulative=True)) if router else {}
+
+    print(f"\n  ╔══════════════════════════════════════════════════════════╗")
+    print(f"  ║  TEST RESULT  │  acc={test_acc:.4f}  loss={test_loss:.4f}")
+    print(f"  ║  Run time     │  {run_time/60:.2f} min")
+    print(f"  ║  FLOPs↓ (overall) │  {overall_flops_red:.2%}")
+    print(f"  ╚══════════════════════════════════════════════════════════╝\n")
+
+    return dict(
+        test_acc           = test_acc,
+        test_loss          = test_loss,
+        best_val_acc       = best_val_acc,
+        run_time_min       = run_time / 60,
+        overall_flops_red  = overall_flops_red,
+        epoch_logs         = epoch_logs,
+        cum_router_stats   = cum_router_stats,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — EXPERIMENT CONFIGURATION & RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
+
+SEEDS   = [42, 123, 456]
+METHODS = ["dense", "deepfocus", "random"]
+
+EXPS = {
+    # ── A: SST-2 with the same architecture as the paper ──────────────────
+    "A_sst2_small": dict(
+        label      = "SST-2 / Transformer-4.5M",
+        dataset    = "sst2",    n_classes = 2,
+        n_train    = 16_000,   n_val = 2_000, n_test = 2_000,
+        model_type = "transformer",
+        d_model=128, n_heads=4, ffn_dim=512, n_layers=3,
+        epochs=4, batch_size=64, lr=3e-4,
+    ),
+    # ── B: AG News — harder (4-class) ─────────────────────────────────────
+    "B_agnews_small": dict(
+        label      = "AG News / Transformer-4.5M",
+        dataset    = "agnews",  n_classes = 4,
+        n_train    = 16_000,   n_val = 2_000, n_test = 2_000,
+        model_type = "transformer",
+        d_model=128, n_heads=4, ffn_dim=512, n_layers=3,
+        epochs=4, batch_size=64, lr=3e-4,
+    ),
+    # ── C: SST-2 with 4× larger model ─────────────────────────────────────
+    "C_sst2_large": dict(
+        label      = "SST-2 / Transformer-18M",
+        dataset    = "sst2",    n_classes = 2,
+        n_train    = 16_000,   n_val = 2_000, n_test = 2_000,
+        model_type = "transformer",
+        d_model=256, n_heads=8, ffn_dim=1024, n_layers=6,
+        epochs=4, batch_size=32, lr=1e-4,
+    ),
+    # ── D: CIFAR-10 vision ─────────────────────────────────────────────────
+    "D_cifar10": dict(
+        label      = "CIFAR-10 / ResNet-18-11M",
+        dataset    = "cifar10", n_classes = 10,
+        model_type = "resnet18",
+        epochs=8, batch_size=128, lr=1e-3,
+    ),
+}
+
+# Containers
+ALL: dict = {k: {m: {} for m in METHODS} for k in EXPS}
+
+
+def build_model(cfg: dict) -> nn.Module:
+    if cfg["model_type"] == "transformer":
+        return TransformerClassifier(
+            n_classes = cfg["n_classes"],
+            d_model   = cfg["d_model"],
+            n_heads   = cfg["n_heads"],
+            ffn_dim   = cfg["ffn_dim"],
+            n_layers  = cfg["n_layers"],
+            vocab_size = VOCAB_SIZE,
+            max_len   = MAX_LEN,
+        ).to(DEVICE)
+    elif cfg["model_type"] == "resnet18":
+        return ResNet18(n_classes=cfg["n_classes"]).to(DEVICE)
+    raise ValueError(cfg["model_type"])
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+_benchmark_start = time.time()
+
+for exp_id, cfg in EXPS.items():
+    print("\n" + "═" * 76)
+    print(f"  EXPERIMENT {exp_id}  ─  {cfg['label']}")
+    print("═" * 76)
+
+    is_text = cfg["dataset"] in ("sst2", "agnews")
+
+    for method in METHODS:
+        print(f"\n{'▶' * 3}  Method: {method.upper()}  {'◀' * 3}")
+
+        for seed in SEEDS:
+            print(f"\n  ── Seed {seed} ──────────────────────────────────────────────────")
+
+            # Reproducibility
+            random.seed(seed); np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+            # Model
+            model = build_model(cfg)
+            n_blocks = len(model.get_blocks())
+            print(f"  Model: {model.n_params()/1e6:.2f}M params  │  {n_blocks} routing blocks")
+
+            # Router (only for deepfocus)
+            router = (
+                dfe.DeepFocusRouter(n_blocks, ema_alpha=0.05, bernoulli_p=0.01)
+                if method == "deepfocus" else None
+            )
+
+            # Dataloaders
+            if is_text:
+                tr_dl, vl_dl, te_dl = make_text_loaders(
+                    cfg["dataset"], cfg["n_train"], cfg["n_val"], cfg["n_test"],
+                    cfg["batch_size"], seed,
+                )
+            else:
+                tr_dl, vl_dl, te_dl = make_cifar10_loaders(cfg["batch_size"], seed)
+
+            result = train_one_run(
+                model, tr_dl, vl_dl, te_dl,
+                method  = method,
+                router  = router,
+                epochs  = cfg["epochs"],
+                lr      = cfg["lr"],
+                is_text = is_text,
+                label   = cfg["label"],
+            )
+
+            ALL[exp_id][method][seed] = result
+            del model; torch.cuda.empty_cache()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — STATISTICAL ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def bootstrap_ci(vals: list, n_boot: int = 1000, ci: float = 0.95):
+    a = np.array(vals, dtype=float)
+    boots = [np.mean(np.random.choice(a, len(a), replace=True)) for _ in range(n_boot)]
+    lo = np.percentile(boots, (1 - ci) / 2 * 100)
+    hi = np.percentile(boots, (1 + ci) / 2 * 100)
+    return lo, hi
+
+def cohens_d(a, b):
+    a, b = np.array(a, float), np.array(b, float)
+    s = math.sqrt((a.std(ddof=1)**2 + b.std(ddof=1)**2) / 2)
+    return (a.mean() - b.mean()) / s if s > 1e-12 else 0.0
+
+STATS: dict = {}
+
+for exp_id in EXPS:
+    STATS[exp_id] = {}
+    dense_accs = [ALL[exp_id]["dense"][s]["test_acc"] for s in SEEDS]
+
+    for method in METHODS:
+        accs   = np.array([ALL[exp_id][method][s]["test_acc"]         for s in SEEDS])
+        flops  = np.array([ALL[exp_id][method][s]["overall_flops_red"] for s in SEEDS])
+        times  = np.array([ALL[exp_id][method][s]["run_time_min"]      for s in SEEDS])
+        ci_lo, ci_hi = bootstrap_ci(accs.tolist())
+        rec = dict(
+            mean      = accs.mean(),
+            std       = accs.std(ddof=1),
+            min       = accs.min(),
+            max       = accs.max(),
+            ci_lo     = ci_lo,
+            ci_hi     = ci_hi,
+            flops_red = flops.mean(),
+            time_min  = times.mean(),
+            per_seed  = {s: ALL[exp_id][method][s]["test_acc"] for s in SEEDS},
+        )
+        if method != "dense":
+            t, p = scipy_stats.ttest_ind(accs, np.array(dense_accs), equal_var=False)
+            d    = cohens_d(accs.tolist(), dense_accs)
+            rec.update(welch_t=t, p_value=p, cohens_d=d, sig05=p < 0.05, sig10=p < 0.10)
+        STATS[exp_id][method] = rec
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9 — GRAND RESULTS TABLES
+# ══════════════════════════════════════════════════════════════════════════════
+
+_total_time = time.time() - _benchmark_start
+
+print("\n\n" + "═" * 76)
+print("  GRAND RESULTS  —  All Experiments  ×  All Methods  ×  All Seeds")
+print(f"  Total benchmark time: {_total_time/60:.1f} min")
+print("═" * 76)
+
+for exp_id, cfg in EXPS.items():
+    dense_mean = STATS[exp_id]["dense"]["mean"]
+    print(f"\n  ┌ {exp_id}: {cfg['label']}")
+    print(f"  │{'Method':<13}│{'Mean Acc':>10}│{'±Std':>7}│{'95% CI':>20}│{'Δacc':>8}│{'p-val':>8}│{'Cohen d':>9}│{'FLOPs↓':>8}│{'min':>8}│")
+    print(f"  ├{'─'*13}┼{'─'*10}┼{'─'*7}┼{'─'*20}┼{'─'*8}┼{'─'*8}┼{'─'*9}┼{'─'*8}┼{'─'*8}┤")
+
+    for method in METHODS:
+        r = STATS[exp_id][method]
+        ci   = f"[{r['ci_lo']:.4f},{r['ci_hi']:.4f}]"
+        p_s  = f"{r.get('p_value', float('nan')):.4f}" if "p_value" in r else "  (ref)"
+        d_s  = f"{r.get('cohens_d', 0.0):+.3f}"        if "cohens_d" in r else "  (ref)"
+        sig  = "**" if r.get("sig05") else ("*" if r.get("sig10") else "  ")
+        delt = r["mean"] - dense_mean
+        print(f"  │{method:<13}│{r['mean']:>10.4f}│{r['std']:>7.4f}│{ci:>20}│{delt:>+8.4f}│{p_s+sig:>8}│{d_s:>9}│{r['flops_red']:>8.2%}│{r['time_min']:>7.1f}m│")
+
+    print(f"  │  Per-seed breakdown:")
+    for method in METHODS:
+        seeds_str = "  ".join(f"s{s}={STATS[exp_id][method]['per_seed'][s]:.4f}" for s in SEEDS)
+        print(f"  │    {method:<12}: {seeds_str}")
+
+print(f"\n  Legend: ** p<0.05  * p<0.10  (Welch t-test vs Dense baseline, two-sided)")
+print(f"  FLOPs↓ = theoretical backward compute reduction")
+print(f"  Cohen d = standardised effect size (|d|>0.2 small, |d|>0.5 medium, |d|>0.8 large)")
+
+# ── Per-experiment router diagnostics (DeepFocus only) ───────────────────────
+print(f"\n\n  DEEPFOCUS ROUTING DIAGNOSTICS (cumulative over all seeds, per experiment)")
+print("  " + "─" * 72)
+for exp_id in EXPS:
+    for seed in SEEDS:
+        r = ALL[exp_id]["deepfocus"][seed]
+        rs = r.get("cum_router_stats", {})
+        if not rs: continue
+        print(f"  {exp_id}  seed={seed}  │  "
+              f"Skip={rs.get('skip_rate',0):.2%}  "
+              f"Low={rs.get('low_rate',0):.2%}  "
+              f"Full={rs.get('full_rate',0):.2%}  │  "
+              f"FLOPs used={rs.get('flops_used',1):.2%}  "
+              f"α={rs.get('alpha_mean',0):.4f}  β={rs.get('beta_mean',1):.4f}  "
+              f"decisions={rs.get('total_decisions',0):,}")
+
+# ── Save JSON ─────────────────────────────────────────────────────────────────
+def _serial(obj):
+    if isinstance(obj, (np.floating, float)): return float(obj)
+    if isinstance(obj, (np.integer, int)):    return int(obj)
+    if isinstance(obj, np.ndarray):           return obj.tolist()
+    if isinstance(obj, dict):  return {k: _serial(v) for k, v in obj.items()}
+    if isinstance(obj, list):  return [_serial(v) for v in obj]
+    if isinstance(obj, bool):  return obj
+    return obj
+
+_out = dict(
+    stats          = _serial(STATS),
+    total_time_min = _total_time / 60,
+    seeds          = SEEDS,
+    methods        = METHODS,
+    experiments    = {k: {j: v for j, v in cfg.items() if not callable(v)}
+                      for k, cfg in EXPS.items()},
+)
+_json_path = "/tmp/deepfocus_results.json"
+with open(_json_path, "w") as _f:
+    json.dump(_out, _f, indent=2)
+
+print(f"\n\n  Full results → {_json_path}")
+print("  ✅  DeepFocus-BP Extended Benchmark Complete!\n")
